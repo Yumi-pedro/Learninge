@@ -47,9 +47,6 @@ class AnalysisTests(unittest.TestCase):
             self.assertFalse(sent['think'])
             self.assertEqual(sent['format'], server.SCHEMA)
 
-if __name__ == '__main__':
-    unittest.main()
-
 class HttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -107,3 +104,84 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.request('/api/analyze', {'text': 'Hello.'})[0], 400)
         with patch.object(server, 'ollama', return_value={'remote_host': 'https://example.com'}):
             self.assertEqual(self.request('/api/analyze', {'text': 'Hello.'})[0], 400)
+
+class ComparisonTests(unittest.TestCase):
+    previous = {'text': 'Yesterday I go to the park.', 'issues': [
+        {'type': '语法错误', 'original': 'go', 'suggestion': 'went'}], 'phrases': []}
+    text = 'Yesterday I went to the park.'
+
+    def comparison_result(self):
+        result = copy.deepcopy(RESULT)
+        result['referenceAnswer'] = self.text
+        result['comparison'] = {'summary': '这次正确使用了过去时。', 'changes': [
+            {'before': 'I go', 'after': 'I went', 'status': '已改善', 'explanation': '本轮用 went 表达昨天的动作。'}]}
+        return result
+
+    def test_valid_comparison_preserves_both_quotes(self):
+        result = server.validate_analysis(self.comparison_result(), self.text, self.previous)
+        self.assertEqual(result['comparison']['changes'][0]['after'], 'I went')
+
+    def test_fabricated_either_round_quote_rejected(self):
+        for key in ['before', 'after']:
+            result = self.comparison_result()
+            result['comparison']['changes'][0][key] = 'I visited London'
+            with self.subTest(key=key), self.assertRaises(server.SetupError):
+                server.validate_analysis(result, self.text, self.previous)
+
+    def test_no_evidence_allows_empty_changes(self):
+        result = self.comparison_result()
+        result['comparison'] = {'summary': '内容不同，无法直接比较。', 'changes': []}
+        self.assertEqual(server.validate_analysis(result, 'I love cooking.', self.previous)['comparison']['changes'], [])
+
+    def test_missing_comparison_and_unknown_status_rejected(self):
+        with self.assertRaises(server.SetupError):
+            server.validate_analysis(copy.deepcopy(RESULT), self.text, self.previous)
+        result = self.comparison_result()
+        result['comparison']['changes'][0]['status'] = '已永久掌握'
+        with self.assertRaises(server.SetupError):
+            server.validate_analysis(result, self.text, self.previous)
+
+    def test_previous_errors_cannot_be_current_errors(self):
+        result = self.comparison_result()
+        result['issues'] = [dict(zip(server.ISSUE_FIELDS, ['语法错误', 'I go', 'I went', '过去时', self.text]))]
+        with self.assertRaises(server.SetupError):
+            server.validate_analysis(result, self.text, self.previous)
+
+    def test_noop_and_duplicate_feedback_rejected(self):
+        issue = dict(zip(server.ISSUE_FIELDS, ['可选风格', 'I went', 'I went', '相同', self.text]))
+        result = self.comparison_result()
+        result['issues'] = [issue]
+        with self.assertRaises(server.SetupError):
+            server.validate_analysis(result, self.text, self.previous)
+        issue['suggestion'] = 'I visited'
+        result['issues'] = [issue, issue]
+        with self.assertRaises(server.SetupError):
+            server.validate_analysis(result, self.text, self.previous)
+        result = self.comparison_result()
+        result['recommendations'] *= 2
+        with self.assertRaises(server.SetupError):
+            server.validate_analysis(result, self.text, self.previous)
+
+    def test_unchanged_text_cannot_be_called_improved(self):
+        result = self.comparison_result()
+        result['comparison']['changes'][0]['after'] = 'I go'
+        with self.assertRaises(server.SetupError):
+            server.validate_analysis(result, self.previous['text'], self.previous)
+
+    def test_previous_input_validation(self):
+        for previous in ['', {}, {'text': 'hello', 'issues': 'wrong'},
+                         {'text': 'hello', 'issues': [{'original': 'not in text', 'suggestion': 'ok', 'type': '语法错误'}]}]:
+            with self.subTest(previous=previous), self.assertRaises(ValueError):
+                server.clean_previous(previous)
+        self.assertEqual(server.clean_previous(self.previous), self.previous)
+
+    def test_previous_is_sent_in_separate_field_and_schema_does_not_leak(self):
+        with patch.object(server, 'ollama', return_value={'message': {'content': json.dumps(self.comparison_result())}}) as call:
+            server.analyze(self.text, 'Weekend', self.previous)
+            request = call.call_args.args[1]
+            self.assertEqual(json.loads(request['messages'][1]['content'])['previousRound'], self.previous)
+            self.assertIn('comparison', request['format']['required'])
+        self.assertNotIn('comparison', server.SCHEMA['properties'])
+
+if __name__ == '__main__':
+    unittest.main()

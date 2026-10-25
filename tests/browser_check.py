@@ -30,6 +30,8 @@ with sync_playwright() as p:
                   'recommendations': [{'phrase': 'go for a walk' if walking else 'pick up a skill', 'meaning': '去散步' if walking else '学会一项技能',
                                        'example': 'I go for a walk after dinner.' if walking else 'I want to pick up a new skill.', 'usage': '描述日常生活。'}],
                   'retryTask': '用推荐表达再说一次。'}
+        if route.request.post_data_json.get('previous'):
+            result['comparison']={'summary':'本轮尝试了新的表达，不能仅据此判断已经掌握。','changes':[]}
         route.fulfill(status=200, content_type='application/json', body=json.dumps(result))
     page.route('**/api/analyze', respond)
     page.locator('#retryAnalysis').click()
@@ -48,6 +50,8 @@ with sync_playwright() as p:
     expect(page.locator('#speakingAnalysisPanel')).not_to_be_visible()
     page.locator('#getFeedback').click()
     expect(page.locator('#speakingAnalysisBody')).to_contain_text('pick up a skill')
+    expect(page.locator('.round-comparison')).to_contain_text('I enjoy walking in the park.')
+    expect(page.locator('.round-comparison')).to_contain_text('I want to learn painting.')
     expect(page.locator('#speakingAnalysisBody')).not_to_contain_text('go for a walk')
     # Busy server automatically retries; double-triggering the same answer makes one request.
     busy_calls=[]
@@ -73,13 +77,20 @@ with sync_playwright() as p:
     expect(page.locator('#toast')).to_contain_text('保存失败')
     assert page.evaluate('words.length') == 2
     page.evaluate('() => {Storage.prototype.setItem=window.originalSetItem}')
+    page.locator('#saveSpeaking').click()
     # Editing cancels an in-flight response and immediately hides old feedback.
     page.unroute('**/api/analyze')
     page.route('**/api/analyze', lambda route: route.fulfill(status=502,content_type='application/json',body='{"error":"模型返回格式错误，请重新分析。"}'))
     answer.fill('Another answer.')
     page.locator('#getFeedback').click()
     expect(page.locator('#analysisStatusText')).to_contain_text('模型返回格式错误')
+    page.locator('#saveSpeaking').click()
     page.reload()
+    page.locator('.sidebar [data-page="speaking"]').click()
+    expect(page.locator('#retryContextPanel')).to_contain_text('I enjoy walking in the park.')
+    expect(page.locator('#speakingHistory .round-comparison')).to_contain_text('本轮尝试了新的表达')
+    page.locator('#endRetry').click()
+    expect(page.locator('#retryContextPanel')).not_to_be_visible()
     page.locator('.sidebar [data-page="vocabulary"]').click()
     expect(page.locator('#vocabRows')).to_contain_text('existing')
     expect(page.locator('#vocabRows')).to_contain_text('go for a walk')
