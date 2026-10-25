@@ -102,7 +102,8 @@ $('stopRecording').onclick=()=>{if(!mediaRecorder||mediaRecorder.state!=='record
 if(!SpeechRecognitionAPI){setSpeechStatus('浏览器不支持语音识别，可手动输入')}
 $('newTopic').onclick=()=>{invalidateAnalysis();topicIndex=(topicIndex+1)%topics.length;$('speakingTopic').textContent=topics[topicIndex][0];document.querySelector('.prompt .tag').textContent='TODAY’S CHALLENGE · '+topics[topicIndex][1]};
 
-let currentAnalysis=null,analysisRequestId=0,analysisDebounce=null,analysisController=null;
+let currentAnalysis=null,analysisRequestId=0,analysisDebounce=null,analysisController=null,pendingAnalysisKey=null;
+function setAnalysisBusy(busy){$('getFeedback').disabled=busy;$('retryAnalysis').disabled=busy;}
 function sentenceForMatch(text, phrase){const sentences=text.match(/[^.!?]+[.!?]?/g)||[text];const sentence=sentences.find(s=>s.toLowerCase().includes(String(phrase).toLowerCase()));return (sentence||text).trim()}
 function makeRuleAnalysis(text){
  const issues=[];const used=new Set();
@@ -153,9 +154,16 @@ async function speakText(text){
 function speakRecommendation(index){const rec=currentAnalysis?.recommendations?.[index];if(rec)speakText(rec.example&&rec.example.length<260?rec.example:rec.phrase)}
 function addRecommendationToVocabulary(index){const rec=currentAnalysis?.recommendations?.[index];if(!rec)return;const word=String(rec.phrase||'').trim();if(!word){toast('这条表达没有内容，无法加入');return}if(findExistingWord(word)){toast('词汇本中已有这个表达，没有重复添加');renderSpeakingAnalysis(currentAnalysis);return}const entry={word,meaning:rec.meaning||'来自口语分析的推荐表达',collocation:rec.usage||'',example:rec.example||'',status:'新词',level:0,source:'Speaking'};const updated=[entry,...words];try{save('words',updated)}catch(e){toast('保存失败：'+e.message);return}words=updated;renderWords();renderHome();toast('已加入词汇本，可在复习训练中练习');renderSpeakingAnalysis(currentAnalysis)}
 async function askOllamaToAnalyze(text,requestId){
- if(analysisController)analysisController.abort();analysisController=new AbortController();const controller=analysisController;const timer=setTimeout(()=>controller.abort(),190000);
+ if(analysisController)analysisController.abort();analysisController=new AbortController();const controller=analysisController;const timer=setTimeout(()=>controller.abort(),380000);
  try{
-  const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({text,topic:$('speakingTopic').textContent})});
+  let response;
+  while(true){
+  response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({text,topic:$('speakingTopic').textContent})});
+  if(response.status!==429)break;
+  if(requestId===analysisRequestId)$('analysisStatusText').textContent='上一份分析仍在结束，正在自动等待。无需反复点击；轮到本次回答后会继续分析。';
+  await new Promise((resolve,reject)=>{const cancel=()=>{clearTimeout(wait);reject(new DOMException('Cancelled','AbortError'))};const wait=setTimeout(()=>{controller.signal.removeEventListener('abort',cancel);resolve()},2000);controller.signal.addEventListener('abort',cancel,{once:true});if(controller.signal.aborted)cancel()});
+  if(requestId===analysisRequestId)$('analysisStatusText').textContent='正在等待或分析当前回答，请保持页面打开。原文和录音不会清空。';
+  }
   let data;try{data=await response.json()}catch(e){throw new Error('本地分析接口未启动。请停止旧的 Python 网页服务，使用 start.command 或 python3 server.py 启动。')}
   if(!response.ok)throw new Error(data.error||`本地服务返回 HTTP ${response.status}`);
   if(requestId!==analysisRequestId)return null;
@@ -165,16 +173,19 @@ async function askOllamaToAnalyze(text,requestId){
 }
 async function triggerSpeakingAnalysis(text,options={}){
  clearTimeout(analysisDebounce);
- const source=String(text||'').trim();const requestId=++analysisRequestId;
+ const source=String(text||'').trim();const key=JSON.stringify([source,$('speakingTopic').textContent]);
+ if(pendingAnalysisKey===key&&analysisController&&!analysisController.signal.aborted)return;
+ const requestId=++analysisRequestId;pendingAnalysisKey=key;setAnalysisBusy(true);
  if(analysisController)analysisController.abort();currentAnalysis=null;
- if(!source){$('speakingAnalysisPanel').classList.remove('show');return}
+ if(!source){pendingAnalysisKey=null;setAnalysisBusy(false);$('speakingAnalysisPanel').classList.remove('show');return}
  $('speakingAnalysisPanel').classList.add('show');$('analysisEngineTag').textContent='正在分析';
  $('speakingAnalysisBody').textContent='';$('analysisStatusText').textContent='正在由本机 Ollama 分析本次回答，首次加载模型可能需要1–3分钟。原文不会被改写。';
  try{const result=await askOllamaToAnalyze(source,requestId);if(result&&requestId===analysisRequestId){result.sourceText=source;result.topic=$('speakingTopic').textContent;renderSpeakingAnalysis(result)}}
  catch(err){if(requestId===analysisRequestId){$('analysisEngineTag').textContent='AI 分析未完成';$('analysisStatusText').textContent=err.message+' 原文和录音已保留。可以点“重新分析”，或明确选择下方的基础规则。';$('speakingAnalysisBody').textContent=''}}
+ finally{if(requestId===analysisRequestId){pendingAnalysisKey=null;setAnalysisBusy(false)}}
 }
-$('basicAnalysis').onclick=()=>{clearTimeout(analysisDebounce);++analysisRequestId;analysisController?.abort();const text=$('speakingAnswer').value.trim();if(!text)return toast('请先输入英文');const result=makeRuleAnalysis(text);result.sourceText=text;result.topic=$('speakingTopic').textContent;renderSpeakingAnalysis(result)};
-function invalidateAnalysis(){clearTimeout(analysisDebounce);++analysisRequestId;analysisController?.abort();currentAnalysis=null;++ttsGeneration;window.speechSynthesis?.cancel();$('speakingAnalysisBody').textContent='';$('speakingAnalysisPanel').classList.remove('show')}
+$('basicAnalysis').onclick=()=>{pendingAnalysisKey=null;setAnalysisBusy(false);clearTimeout(analysisDebounce);++analysisRequestId;analysisController?.abort();const text=$('speakingAnswer').value.trim();if(!text)return toast('请先输入英文');const result=makeRuleAnalysis(text);result.sourceText=text;result.topic=$('speakingTopic').textContent;renderSpeakingAnalysis(result)};
+function invalidateAnalysis(){pendingAnalysisKey=null;setAnalysisBusy(false);clearTimeout(analysisDebounce);++analysisRequestId;analysisController?.abort();currentAnalysis=null;++ttsGeneration;window.speechSynthesis?.cancel();$('speakingAnalysisBody').textContent='';$('speakingAnalysisPanel').classList.remove('show')}
 $('getFeedback').onclick=()=>{const text=$('speakingAnswer').value.trim();if(!text){toast('请先录音或输入英文回答');return}triggerSpeakingAnalysis(text)};
 $('retryAnalysis').onclick=()=>{const text=$('speakingAnswer').value.trim();if(!text){toast('请先录音或输入英文回答');return}triggerSpeakingAnalysis(text)};
 $('speakingAnswer').addEventListener('input',()=>{invalidateAnalysis();const text=$('speakingAnswer').value.trim();if(!text)return;analysisDebounce=setTimeout(()=>triggerSpeakingAnalysis(text,{reason:'edit'}),1500)});

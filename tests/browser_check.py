@@ -49,6 +49,24 @@ with sync_playwright() as p:
     page.locator('#getFeedback').click()
     expect(page.locator('#speakingAnalysisBody')).to_contain_text('pick up a skill')
     expect(page.locator('#speakingAnalysisBody')).not_to_contain_text('go for a walk')
+    # Busy server automatically retries; double-triggering the same answer makes one request.
+    busy_calls=[]
+    page.unroute('**/api/analyze')
+    def busy_then_ready(route):
+        busy_calls.append(route)
+        if len(busy_calls)==1:
+            route.fulfill(status=429,content_type='application/json',body='{"error":"busy"}')
+        else:
+            respond(route)
+    page.route('**/api/analyze',busy_then_ready)
+    page.evaluate("() => {triggerSpeakingAnalysis($('speakingAnswer').value);triggerSpeakingAnalysis($('speakingAnswer').value)}")
+    expect(page.locator('#analysisStatusText')).to_contain_text('自动等待')
+    expect(page.locator('#getFeedback')).to_be_disabled()
+    expect(page.locator('#retryAnalysis')).to_be_disabled()
+    assert len(busy_calls)==1
+    expect(page.locator('#analysisEngineTag')).to_have_text('本机 Ollama AI',timeout=6000)
+    assert len(busy_calls)==2
+    expect(page.locator('#getFeedback')).to_be_enabled()
     # Force storage failure: no false success and no in-memory insertion.
     page.evaluate("() => {window.originalSetItem=Storage.prototype.setItem;Storage.prototype.setItem=function(){throw new DOMException('Storage full','QuotaExceededError')}}")
     page.locator('[data-add-rec="0"]').click()
